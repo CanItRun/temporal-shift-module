@@ -5,6 +5,12 @@
 
 import argparse
 parser = argparse.ArgumentParser(description="PyTorch implementation of Temporal Segment Networks")
+
+
+
+pm = Params()
+pm.dataset = pm.choice()
+
 parser.add_argument('dataset', type=str)
 parser.add_argument('modality', type=str, choices=['RGB', 'Flow'])
 parser.add_argument('--train_list', type=str, default="")

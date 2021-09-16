@@ -20,47 +20,98 @@ from ops.utils import AverageMeter, accuracy
 from ops.temporal_shift import make_temporal_pool
 
 from tensorboardX import SummaryWriter
+from lumo import Params
 
 best_prec1 = 0
 
+from lumo import Params
+
+
+class MyParams(Params):
+
+    def __init__(self):
+        super().__init__()
+        self.dataset = self.choice('UCF101')
+        self.arch = 'BNInception'
+        self.num_class = 101
+        self.num_segments = 1
+        self.consensus_type = 'avg'
+        self.k = 3
+        self.dropout = 0.5
+        self.img_feature_dim = 256
+        self.suffix = None
+        self.temporal_pool = True
+        self.modality = 'RGB'
+        self.shift = False
+        self.shift_div = 8
+        self.shift_place = 'blockres'
+        self.temporal_pool = False
+        self.non_local = False
+        self.dense_sample = False
+        self.pretrain = 'imagenet'
+
+    def iparams(self):
+        super().iparams()
+        full_arch_name = self.arch
+        if self.shift:
+            full_arch_name += '_shift{}_{}'.format(self.shift_div, self.shift_place)
+        if self.temporal_pool:
+            full_arch_name += '_tpool'
+        self.store_name = '_'.join(
+            ['TSM', self.dataset, self.modality, full_arch_name, self.consensus_type, 'segment%d' % self.num_segments,
+             'e{}'.format(self.epochs)])
+        if self.pretrain != 'imagenet':
+            self.store_name += '_{}'.format(self.pretrain)
+        if self.lr_type != 'step':
+            self.store_name += '_{}'.format(self.lr_type)
+        if self.dense_sample:
+            self.store_name += '_dense'
+        if self.non_local > 0:
+            self.store_name += '_nl'
+        if self.suffix is not None:
+            self.store_name += '_{}'.format(self.suffix)
+
 
 def main():
-    global args, best_prec1
-    args = parser.parse_args()
+    # global args, best_prec1
+    # args = parser.parse_args()
 
-    num_class, args.train_list, args.val_list, args.root_path, prefix = dataset_config.return_dataset(args.dataset,
-                                                                                                      args.modality)
-    full_arch_name = args.arch
-    if args.shift:
-        full_arch_name += '_shift{}_{}'.format(args.shift_div, args.shift_place)
-    if args.temporal_pool:
-        full_arch_name += '_tpool'
-    args.store_name = '_'.join(
-        ['TSM', args.dataset, args.modality, full_arch_name, args.consensus_type, 'segment%d' % args.num_segments,
-         'e{}'.format(args.epochs)])
-    if args.pretrain != 'imagenet':
-        args.store_name += '_{}'.format(args.pretrain)
-    if args.lr_type != 'step':
-        args.store_name += '_{}'.format(args.lr_type)
-    if args.dense_sample:
-        args.store_name += '_dense'
-    if args.non_local > 0:
-        args.store_name += '_nl'
-    if args.suffix is not None:
-        args.store_name += '_{}'.format(args.suffix)
-    print('storing name: ' + args.store_name)
+    # num_class, args.train_list, args.val_list, args.root_path, prefix = dataset_config.return_dataset(args.dataset,
+    #                                                                                                   args.modality)
+    # full_arch_name = args.arch
+    # if args.shift:
+    #     full_arch_name += '_shift{}_{}'.format(args.shift_div, args.shift_place)
+    # if args.temporal_pool:
+    #     full_arch_name += '_tpool'
+    # args.store_name = '_'.join(
+    #     ['TSM', args.dataset, args.modality, full_arch_name, args.consensus_type, 'segment%d' % args.num_segments,
+    #      'e{}'.format(args.epochs)])
+    # if args.pretrain != 'imagenet':
+    #     args.store_name += '_{}'.format(args.pretrain)
+    # if args.lr_type != 'step':
+    #     args.store_name += '_{}'.format(args.lr_type)
+    # if args.dense_sample:
+    #     args.store_name += '_dense'
+    # if args.non_local > 0:
+    #     args.store_name += '_nl'
+    # if args.suffix is not None:
+    #     args.store_name += '_{}'.format(args.suffix)
+    # print('storing name: ' + args.store_name)
+
+    args = MyParams()
+    args.from_args()
 
     check_rootfolders()
 
-    model = TSN(num_class, args.num_segments, args.modality,
+    model = TSN(args.num_class, args.num_segments, args.modality,
                 base_model=args.arch,
                 consensus_type=args.consensus_type,
                 dropout=args.dropout,
                 img_feature_dim=args.img_feature_dim,
-                partial_bn=not args.no_partialbn,
+                partial_bn=False,
                 pretrain=args.pretrain,
                 is_shift=args.shift, shift_div=args.shift_div, shift_place=args.shift_place,
-                fc_lr5=not (args.tune_from and args.dataset in args.tune_from),
+                fc_lr5=False,
                 temporal_pool=args.temporal_pool,
                 non_local=args.non_local)
 
@@ -69,58 +120,59 @@ def main():
     input_mean = model.input_mean
     input_std = model.input_std
     policies = model.get_optim_policies()
-    train_augmentation = model.get_augmentation(flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
+    train_augmentation = model.get_augmentation(
+        flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
 
-    model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
-
-    optimizer = torch.optim.SGD(policies,
-                                args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-
-    if args.resume:
-        if args.temporal_pool:  # early temporal pool so that we can load the state_dict
-            make_temporal_pool(model.module.base_model, args.num_segments)
-        if os.path.isfile(args.resume):
-            print(("=> loading checkpoint '{}'".format(args.resume)))
-            checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint['epoch']
-            best_prec1 = checkpoint['best_prec1']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print(("=> loaded checkpoint '{}' (epoch {})"
-                   .format(args.evaluate, checkpoint['epoch'])))
-        else:
-            print(("=> no checkpoint found at '{}'".format(args.resume)))
-
-    if args.tune_from:
-        print(("=> fine-tuning from '{}'".format(args.tune_from)))
-        sd = torch.load(args.tune_from)
-        sd = sd['state_dict']
-        model_dict = model.state_dict()
-        replace_dict = []
-        for k, v in sd.items():
-            if k not in model_dict and k.replace('.net', '') in model_dict:
-                print('=> Load after remove .net: ', k)
-                replace_dict.append((k, k.replace('.net', '')))
-        for k, v in model_dict.items():
-            if k not in sd and k.replace('.net', '') in sd:
-                print('=> Load after adding .net: ', k)
-                replace_dict.append((k.replace('.net', ''), k))
-
-        for k, k_new in replace_dict:
-            sd[k_new] = sd.pop(k)
-        keys1 = set(list(sd.keys()))
-        keys2 = set(list(model_dict.keys()))
-        set_diff = (keys1 - keys2) | (keys2 - keys1)
-        print('#### Notice: keys that failed to load: {}'.format(set_diff))
-        if args.dataset not in args.tune_from:  # new dataset
-            print('=> New dataset, do not load fc weights')
-            sd = {k: v for k, v in sd.items() if 'fc' not in k}
-        if args.modality == 'Flow' and 'Flow' not in args.tune_from:
-            sd = {k: v for k, v in sd.items() if 'conv1.weight' not in k}
-        model_dict.update(sd)
-        model.load_state_dict(model_dict)
+    # model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
+    #
+    # optimizer = torch.optim.SGD(policies,
+    #                             args.lr,
+    #                             momentum=args.momentum,
+    #                             weight_decay=args.weight_decay)
+    #
+    # if args.resume:
+    #     if args.temporal_pool:  # early temporal pool so that we can load the state_dict
+    #         make_temporal_pool(model.module.base_model, args.num_segments)
+    #     if os.path.isfile(args.resume):
+    #         print(("=> loading checkpoint '{}'".format(args.resume)))
+    #         checkpoint = torch.load(args.resume)
+    #         args.start_epoch = checkpoint['epoch']
+    #         best_prec1 = checkpoint['best_prec1']
+    #         model.load_state_dict(checkpoint['state_dict'])
+    #         optimizer.load_state_dict(checkpoint['optimizer'])
+    #         print(("=> loaded checkpoint '{}' (epoch {})"
+    #                .format(args.evaluate, checkpoint['epoch'])))
+    #     else:
+    #         print(("=> no checkpoint found at '{}'".format(args.resume)))
+    #
+    # if args.tune_from:
+    #     print(("=> fine-tuning from '{}'".format(args.tune_from)))
+    #     sd = torch.load(args.tune_from)
+    #     sd = sd['state_dict']
+    #     model_dict = model.state_dict()
+    #     replace_dict = []
+    #     for k, v in sd.items():
+    #         if k not in model_dict and k.replace('.net', '') in model_dict:
+    #             print('=> Load after remove .net: ', k)
+    #             replace_dict.append((k, k.replace('.net', '')))
+    #     for k, v in model_dict.items():
+    #         if k not in sd and k.replace('.net', '') in sd:
+    #             print('=> Load after adding .net: ', k)
+    #             replace_dict.append((k.replace('.net', ''), k))
+    #
+    #     for k, k_new in replace_dict:
+    #         sd[k_new] = sd.pop(k)
+    #     keys1 = set(list(sd.keys()))
+    #     keys2 = set(list(model_dict.keys()))
+    #     set_diff = (keys1 - keys2) | (keys2 - keys1)
+    #     print('#### Notice: keys that failed to load: {}'.format(set_diff))
+    #     if args.dataset not in args.tune_from:  # new dataset
+    #         print('=> New dataset, do not load fc weights')
+    #         sd = {k: v for k, v in sd.items() if 'fc' not in k}
+    #     if args.modality == 'Flow' and 'Flow' not in args.tune_from:
+    #         sd = {k: v for k, v in sd.items() if 'conv1.weight' not in k}
+    #     model_dict.update(sd)
+    #     model.load_state_dict(model_dict)
 
     if args.temporal_pool and not args.resume:
         make_temporal_pool(model.module.base_model, args.num_segments)
@@ -128,92 +180,92 @@ def main():
     cudnn.benchmark = True
 
     # Data loading code
-    if args.modality != 'RGBDiff':
-        normalize = GroupNormalize(input_mean, input_std)
-    else:
-        normalize = IdentityTransform()
+    # if args.modality != 'RGBDiff':
+    #     normalize = GroupNormalize(input_mean, input_std)
+    # else:
+    #     normalize = IdentityTransform()
 
-    if args.modality == 'RGB':
-        data_length = 1
-    elif args.modality in ['Flow', 'RGBDiff']:
-        data_length = 5
+    # if args.modality == 'RGB':
+    data_length = 1
+    # elif args.modality in ['Flow', 'RGBDiff']:
+    #     data_length = 5
 
-    train_loader = torch.utils.data.DataLoader(
-        TSNDataSet(args.root_path, args.train_list, num_segments=args.num_segments,
-                   new_length=data_length,
-                   modality=args.modality,
-                   image_tmpl=prefix,
-                   transform=torchvision.transforms.Compose([
-                       train_augmentation,
-                       Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
-                       ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
-                       normalize,
-                   ]), dense_sample=args.dense_sample),
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True,
-        drop_last=True)  # prevent something not % n_GPU
-
-    val_loader = torch.utils.data.DataLoader(
-        TSNDataSet(args.root_path, args.val_list, num_segments=args.num_segments,
-                   new_length=data_length,
-                   modality=args.modality,
-                   image_tmpl=prefix,
-                   random_shift=False,
-                   transform=torchvision.transforms.Compose([
-                       GroupScale(int(scale_size)),
-                       GroupCenterCrop(crop_size),
-                       Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
-                       ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
-                       normalize,
-                   ]), dense_sample=args.dense_sample),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+    # train_loader = torch.utils.data.DataLoader(
+    #     TSNDataSet(args.root_path, args.train_list, num_segments=args.num_segments,
+    #                new_length=data_length,
+    #                modality=args.modality,
+    #                image_tmpl=prefix,
+    #                transform=torchvision.transforms.Compose([
+    #                    train_augmentation,
+    #                    Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
+    #                    ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
+    #                    normalize,
+    #                ]), dense_sample=args.dense_sample),
+    #     batch_size=args.batch_size, shuffle=True,
+    #     num_workers=args.workers, pin_memory=True,
+    #     drop_last=True)  # prevent something not % n_GPU
+    #
+    # val_loader = torch.utils.data.DataLoader(
+    #     TSNDataSet(args.root_path, args.val_list, num_segments=args.num_segments,
+    #                new_length=data_length,
+    #                modality=args.modality,
+    #                image_tmpl=prefix,
+    #                random_shift=False,
+    #                transform=torchvision.transforms.Compose([
+    #                    GroupScale(int(scale_size)),
+    #                    GroupCenterCrop(crop_size),
+    #                    Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
+    #                    ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
+    #                    normalize,
+    #                ]), dense_sample=args.dense_sample),
+    #     batch_size=args.batch_size, shuffle=False,
+    #     num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
-    if args.loss_type == 'nll':
-        criterion = torch.nn.CrossEntropyLoss().cuda()
-    else:
-        raise ValueError("Unknown loss type")
+    # if args.loss_type == 'nll':
+    #     criterion = torch.nn.CrossEntropyLoss().cuda()
+    # else:
+    #     raise ValueError("Unknown loss type")
+    #
+    # for group in policies:
+    #     print(('group: {} has {} params, lr_mult: {}, decay_mult: {}'.format(
+    #         group['name'], len(group['params']), group['lr_mult'], group['decay_mult'])))
 
-    for group in policies:
-        print(('group: {} has {} params, lr_mult: {}, decay_mult: {}'.format(
-            group['name'], len(group['params']), group['lr_mult'], group['decay_mult'])))
+    # if args.evaluate:
+    #     validate(val_loader, model, criterion, 0)
+    #     return
 
-    if args.evaluate:
-        validate(val_loader, model, criterion, 0)
-        return
-
-    log_training = open(os.path.join(args.root_log, args.store_name, 'log.csv'), 'w')
-    with open(os.path.join(args.root_log, args.store_name, 'args.txt'), 'w') as f:
-        f.write(str(args))
-    tf_writer = SummaryWriter(log_dir=os.path.join(args.root_log, args.store_name))
-    for epoch in range(args.start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch, args.lr_type, args.lr_steps)
-
-        # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
-
-        # evaluate on validation set
-        if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
-            prec1 = validate(val_loader, model, criterion, epoch, log_training, tf_writer)
-
-            # remember best prec@1 and save checkpoint
-            is_best = prec1 > best_prec1
-            best_prec1 = max(prec1, best_prec1)
-            tf_writer.add_scalar('acc/test_top1_best', best_prec1, epoch)
-
-            output_best = 'Best Prec@1: %.3f\n' % (best_prec1)
-            print(output_best)
-            log_training.write(output_best + '\n')
-            log_training.flush()
-
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'best_prec1': best_prec1,
-            }, is_best)
+    # log_training = open(os.path.join(args.root_log, args.store_name, 'log.csv'), 'w')
+    # with open(os.path.join(args.root_log, args.store_name, 'args.txt'), 'w') as f:
+    #     f.write(str(args))
+    # tf_writer = SummaryWriter(log_dir=os.path.join(args.root_log, args.store_name))
+    # for epoch in range(args.start_epoch, args.epochs):
+    #     adjust_learning_rate(optimizer, epoch, args.lr_type, args.lr_steps)
+    #
+    #     # train for one epoch
+    #     train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
+    #
+    #     # evaluate on validation set
+    #     if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
+    #         prec1 = validate(val_loader, model, criterion, epoch, log_training, tf_writer)
+    #
+    #         # remember best prec@1 and save checkpoint
+    #         is_best = prec1 > best_prec1
+    #         best_prec1 = max(prec1, best_prec1)
+    #         tf_writer.add_scalar('acc/test_top1_best', best_prec1, epoch)
+    #
+    #         output_best = 'Best Prec@1: %.3f\n' % (best_prec1)
+    #         print(output_best)
+    #         log_training.write(output_best + '\n')
+    #         log_training.flush()
+    #
+    #         save_checkpoint({
+    #             'epoch': epoch + 1,
+    #             'arch': args.arch,
+    #             'state_dict': model.state_dict(),
+    #             'optimizer': optimizer.state_dict(),
+    #             'best_prec1': best_prec1,
+    #         }, is_best)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
@@ -271,7 +323,8 @@ def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
                       'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                       'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                 epoch, i, len(train_loader), batch_time=batch_time,
-                data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'] * 0.1))  # TODO
+                data_time=data_time, loss=losses, top1=top1, top5=top5,
+                lr=optimizer.param_groups[-1]['lr'] * 0.1))  # TODO
             print(output)
             log.write(output + '\n')
             log.flush()
